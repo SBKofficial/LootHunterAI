@@ -3,8 +3,8 @@ import logging
 import urllib.parse
 import re
 from datetime import datetime, timedelta
-
-# Third-party libraries
+import time
+from google.api_core import exceptions as google_exceptions
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from google import genai
@@ -57,48 +57,66 @@ def monetize_links(text):
 
 def get_shopping_advice(query):
     """
-    Searches via Gemini 2.0 Flash. Checks Cache first.
+    Searches via Gemini. Includes automatic Retry logic and Fallback to stable models.
     """
     # 1. Check Cache
     if query in search_cache:
         logger.info(f"Cache Hit for: {query}")
         return search_cache[query]
 
-    # 2. If not in cache, ask Gemini
-    try:
-        logger.info(f"Searching Live for: {query}")
-        
-        google_search_tool = types.Tool(
-            google_search=types.GoogleSearch()
-        )
+    logger.info(f"Searching Live for: {query}")
+    
+    # Define the tool once
+    google_search_tool = types.Tool(
+        google_search=types.GoogleSearch()
+    )
 
-        prompt = f"""
-        Act as a friendly Indian shopping assistant. User wants: "{query}"
-        
-        1. Search Google for the 3 BEST options available in India right now.
-        2. Format specific model names, REAL prices in Rupees (₹), and a 1-sentence "Why this?"
-        3. Do NOT invent prices. Use real data.
-        4. Keep it concise.
-        """
+    prompt = f"""
+    Act as a friendly Indian shopping assistant. User wants: "{query}"
+    
+    1. Search Google for the 3 BEST options available in India right now.
+    2. Format specific model names, REAL prices in Rupees (₹), and a 1-sentence "Why this?"
+    3. Do NOT invent prices. Use real data.
+    4. Keep it concise.
+    """
 
-        response = client.models.generate_content(
-            model='gemini-2.0-flash-exp', 
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[google_search_tool],
-                response_modalities=["TEXT"]
-            )
-        )
-        
-        # 3. Save to Cache
-        result_text = response.text
-        search_cache[query] = result_text
-        return result_text
+    # --- RETRY LOGIC (The Fix) ---
+    # We try up to 3 times if the API is busy
+    max_retries = 3
+    
+    # Priority list: Try 2.0 first, if it fails, fallback to 1.5 (Stable)
+    models_to_try = ['gemini-2.0-flash-exp', 'gemini-1.5-flash']
 
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-        return "⚠️ I'm having trouble connecting to the market server. Please try again in 1 minute."
+    for model_name in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Attempting with model: {model_name} (Try {attempt+1})")
+                
+                response = client.models.generate_content(
+                    model=model_name, 
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[google_search_tool],
+                        response_modalities=["TEXT"]
+                    )
+                )
+                
+                # Success! Save to cache and return
+                result_text = response.text
+                search_cache[query] = result_text
+                return result_text
 
+            except Exception as e:
+                # Check if it's a "Too Many Requests" (429) error
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    logger.warning(f"Rate Limit Hit on {model_name}. Waiting 5s...")
+                    time.sleep(5) # Wait 5 seconds before retrying
+                else:
+                    logger.error(f"Gemini Error ({model_name}): {e}")
+                    break # If it's a different error, stop trying this model
+
+    # If all attempts fail
+    return "⚠️ The market server is very busy right now. Please try again in 1 minute!"
 # --- TELEGRAM HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
